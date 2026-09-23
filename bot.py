@@ -159,13 +159,17 @@ async def on_text(message: Message) -> None:
     updater = StatusUpdater(status)
 
     async with slot:
+        path: Optional[str] = None
+        info: dict = {}
+
         if query:
+            # 1) Matnni YouTube'da qidiramiz
             updater.set(
                 f"🔍 «{html.escape(query)}» bo'yicha qidirilmoqda...", force=True
             )
             try:
-                url, found_title = await asyncio.to_thread(
-                    downloader.search_first, query
+                candidates = await asyncio.to_thread(
+                    downloader.search_candidates, query
                 )
             except downloader.DownloadError as exc:
                 log.warning("Qidiruvda xatolik %s -> %s", query, exc)
@@ -178,26 +182,54 @@ async def on_text(message: Message) -> None:
                 )
                 return
 
+            # 2) Topilgan variantlarni birin-ketin yuklashga urinamiz:
+            # birinchi video ochilmasa — keyingisiga o'tamiz.
             platform = "YouTube"
-            updater.set(
-                f"🎵 Topildi: <b>{html.escape(found_title)}</b>\n⏳ Yuklanmoqda...",
-                force=True,
-            )
+            last_error: Optional[Exception] = None
+            for candidate_url, candidate_title in candidates:
+                updater.set(
+                    f"🎵 Topildi: <b>{html.escape(candidate_title)}</b>\n"
+                    "⏳ Yuklanmoqda...",
+                    force=True,
+                )
+                try:
+                    path, info = await asyncio.to_thread(
+                        downloader.download_audio,
+                        candidate_url,
+                        make_progress_hook(updater, platform),
+                    )
+                    url = candidate_url
+                    break
+                except downloader.DownloadError as exc:
+                    last_error = exc
+                    log.info("Variant yuklanmadi %s -> %s", candidate_url, exc)
 
-        updater.set(f"⏳ <b>{platform}</b>: musiqa yuklanmoqda...", force=True)
-        path: Optional[str] = None
-        try:
-            path, info = await asyncio.to_thread(
-                downloader.download_audio, url, make_progress_hook(updater, platform)
-            )
-        except downloader.DownloadError as exc:
-            log.warning("Yuklashda xatolik %s -> %s", url, exc)
-            await updater.done(f"❌ {html.escape(str(exc))}")
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Kutilmagan xatolik: %s", url)
-            await updater.done(f"❌ Kutilmagan xatolik: {html.escape(str(exc))[:200]}")
-            return
+            if path is None:
+                await updater.done(
+                    "❌ "
+                    + html.escape(
+                        str(last_error)
+                        if last_error
+                        else "Musiqani yuklab bo'lmadi — boshqasini urinib ko'ring."
+                    )
+                )
+                return
+        else:
+            updater.set(f"⏳ <b>{platform}</b>: musiqa yuklanmoqda...", force=True)
+            try:
+                path, info = await asyncio.to_thread(
+                    downloader.download_audio, url, make_progress_hook(updater, platform)
+                )
+            except downloader.DownloadError as exc:
+                log.warning("Yuklashda xatolik %s -> %s", url, exc)
+                await updater.done(f"❌ {html.escape(str(exc))}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Kutilmagan xatolik: %s", url)
+                await updater.done(
+                    f"❌ Kutilmagan xatolik: {html.escape(str(exc))[:200]}"
+                )
+                return
 
         try:
             size = os.path.getsize(path)

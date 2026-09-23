@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from typing import Any, Callable, Optional
 
 import yt_dlp
@@ -242,15 +243,71 @@ def cleanup(path: str) -> None:
         log.warning("Tozalashda xatolik: %s", exc)
 
 
-def search_first(query: str) -> tuple[str, str]:
-    """So'rov bo'yicha YouTube'dan birinchi natijani topadi.
+# Bir so'rov bo'yicha nechta variantni ko'rib chiqamiz (birinchi video
+# ochilmasa — ikkinchisiga o'tamiz)
+SEARCH_LIMIT = 5
+SEARCH_ATTEMPTS = 3
+SEARCH_RETRY_DELAY = 2.0
+
+
+def _clean_query(query: str) -> str:
+    """So'rovni qidiruvga yaroq qilib tozalaydi (tinish belgilari olib tashlanadi)."""
+    cleaned = re.sub(r"[^\w\s'\-]", " ", query, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+# Savol so'zlari — ularni olib tashlash qidiruvni aniqroq qiladi
+_QUESTION_WORDS = {
+    "nima", "nima?", "uchun", "kerak", "kerakmi", "qanday", "qandoq", "qale",
+    "bormi", "bor", "yoq", "ha", "ham", "va", "yoki", "bu", "shu", "meni",
+    "sizni", "bizni", "qilib", "ayt", "ayting", "gapir", "how", "why", "what",
+    "is", "are", "the", "a", "an", "to", "for", "of", "and", "or",
+}
+
+
+def _query_variants(query: str) -> list[str]:
+    """Uzun savol/g'alati matnni qisqartirib, qidiruv variantlari yaratadi."""
+    base = _clean_query(query)
+    if not base:
+        return []
+
+    words = base.split()
+
+    # 1) Oxiridagi savol so'zlarini tashlab qoldiramiz: "ertalabki gimnastika
+    #    nima uchun kerak" -> "ertalabki gimnastika"
+    trimmed = list(words)
+    while len(trimmed) > 2 and trimmed[-1].lower().strip("?!.,") in _QUESTION_WORDS:
+        trimmed.pop()
+    trimmed_text = " ".join(trimmed)
+
+    variants = [trimmed_text, base]
+    if len(words) > 5:
+        variants.append(" ".join(words[:5]))
+    if len(words) > 4:
+        variants.append(" ".join(words[:4]))
+    if len(words) > 2:
+        variants.append(" ".join(words[:2]))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for variant in variants:
+        cleaned = variant.strip()
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            unique.append(cleaned)
+    return unique[:4]
+
+
+def search_candidates(query: str, limit: int = SEARCH_LIMIT) -> list[tuple[str, str]]:
+    """So'rov bo'yicha YouTube natijalarini ro'yxat qilib qaytaradi.
 
     Returns:
-        (video_url, sarlavha)
+        [(video_url, sarlavha), ...] — eng mos natijadan boshlab.
     """
-    cleaned = re.sub(r"\s+", " ", query).strip()
-    if not cleaned:
-        raise DownloadError("Bo'sh so'rov.")
+    variants = _query_variants(query)
+    if not variants:
+        raise DownloadError("Bo'sh so'rov — qo'shiq nomi yoki savol yozing.")
 
     options: dict[str, Any] = {
         "quiet": True,
@@ -259,29 +316,59 @@ def search_first(query: str) -> tuple[str, str]:
         "skip_download": True,
         "socket_timeout": 20,
         "default_search": "ytsearch",
+        # Natijalarni yig'ishda bitta yopiq video butun qidiruvni
+        # yiqitmasligi uchun
+        "ignoreerrors": True,
+        "extract_flat": "in_playlist",
     }
 
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            data = ydl.extract_info(f"ytsearch1:{cleaned}", download=False)
-    except YTDLPDownloadError as exc:
-        raise DownloadError(_friendly_error(str(exc))) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise DownloadError(_friendly_error(str(exc))) from exc
+    last_error: Optional[Exception] = None
 
-    entries = [e for e in (data or {}).get("entries") or [] if e]
-    if not entries:
-        raise DownloadError("Hech narsa topilmadi — boshqa nom bilan urinib ko'ring.")
+    # YouTube vaqtincha bo'sh natija qaytarsa — bir necha marotaba takrorlaymiz
+    for attempt in range(SEARCH_ATTEMPTS):
+        for variant in variants:
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    data = ydl.extract_info(f"ytsearch{limit}:{variant}", download=False)
+            except YTDLPDownloadError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
 
-    first = entries[0]
-    link = first.get("webpage_url") or ""
-    if not link and first.get("id"):
-        link = f"https://www.youtube.com/watch?v={first['id']}"
-    if not link:
-        raise DownloadError("Topilgan video havolasini olib bo'lmadi.")
+            results: list[tuple[str, str]] = []
+            for entry in [e for e in (data or {}).get("entries") or [] if e]:
+                link = entry.get("webpage_url") or ""
+                if not link and entry.get("id"):
+                    link = f"https://www.youtube.com/watch?v={entry['id']}"
+                if link:
+                    title = str(entry.get("title") or variant).strip()
+                    results.append((link, title))
 
-    title = str(first.get("title") or cleaned).strip()
-    return link, title
+            if results:
+                log.info("Qidiruv '%s' -> %d ta natija", variant, len(results))
+                return results
+
+        if attempt < SEARCH_ATTEMPTS - 1:
+            log.info("Qidiruv bo'sh qaytdi, %.0f sekunddan keyin takrorlaymiz", SEARCH_RETRY_DELAY)
+            time.sleep(SEARCH_RETRY_DELAY)
+
+    if last_error is not None:
+        raise DownloadError(_friendly_error(str(last_error)))
+    raise DownloadError(
+        "Hech narsa topilmadi — boshqa nom bilan urinib ko'ring "
+        "yoki birozdan keyin qayta yuboring."
+    )
+
+
+def search_first(query: str) -> tuple[str, str]:
+    """So'rov bo'yicha YouTube'dan birinchi natijani topadi.
+
+    Returns:
+        (video_url, sarlavha)
+    """
+    return search_candidates(query, limit=1)[0]
 
 
 def track_title(info: dict) -> str:
