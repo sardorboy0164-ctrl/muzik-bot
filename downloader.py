@@ -273,11 +273,13 @@ def _query_variants(query: str) -> list[str]:
 
     words = base.split()
 
-    # 1) Oxiridagi savol so'zlarini tashlab qoldiramiz: "ertalabki gimnastika
-    #    nima uchun kerak" -> "ertalabki gimnastika"
+    # 2) Oxiridagi va boshidagi savol so'zlarini tashlab qoldiramiz:
+    #    "ertalabki gimnastika nima uchun kerak" -> "ertalabki gimnastika"
     trimmed = list(words)
-    while len(trimmed) > 2 and trimmed[-1].lower().strip("?!.,") in _QUESTION_WORDS:
+    while len(trimmed) > 1 and trimmed[-1].lower().strip("?!.,") in _QUESTION_WORDS:
         trimmed.pop()
+    while len(trimmed) > 1 and trimmed[0].lower().strip("?!.,") in _QUESTION_WORDS:
+        trimmed.pop(0)
     trimmed_text = " ".join(trimmed)
 
     variants = [trimmed_text, base]
@@ -293,9 +295,13 @@ def _query_variants(query: str) -> list[str]:
     for variant in variants:
         cleaned = variant.strip()
         key = cleaned.lower()
-        if cleaned and key not in seen:
-            seen.add(key)
-            unique.append(cleaned)
+        if not cleaned or key in seen:
+            continue
+        # faqat savol so'zlaridan iborat variant kerak emas
+        if all(w.lower().strip("?!.,") in _QUESTION_WORDS for w in cleaned.split()):
+            continue
+        seen.add(key)
+        unique.append(cleaned)
     return unique[:4]
 
 
