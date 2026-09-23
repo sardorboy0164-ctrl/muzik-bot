@@ -1,3 +1,7 @@
+# Muzik Top — asosiy bog'liqliklar
 aiogram>=3.13,<4
 yt-dlp>=2025.1.15
 python-dotenv>=1.0.1
+
+# Ovozli xabardan musiqa aniqlash (Shazam) `setup.sh` orqali o'rnatiladi,
+# chunki shazamio-core ba'zi Python versiyalarida tayyor wheel'ga ega emas.

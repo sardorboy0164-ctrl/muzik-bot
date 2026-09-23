@@ -1,7 +1,9 @@
 """Muzik Top — Telegram musiqa boti.
 
-Foydalanuvchi YouTube yoki Instagram link yuboradi, bot shu videodan
-musiqani (MP3) ajratib, jo'natadi.
+Foydalanuvchi:
+  • YouTube/Instagram link yuboradi  → videodan MP3 ajratib beradi
+  • Qo'shiq nomini yoki savol yozadi → YouTube'da topib MP3 beradi
+  • Ovozli xabar yuboradi            → musiqani tanib, MP3 beradi (Shazam)
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import html
 import logging
 import os
 import sys
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -22,6 +25,7 @@ from aiogram.types import FSInputFile, Message
 
 import config
 import downloader
+import recognizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +42,9 @@ HELP_TEXT = (
     "<b>Qanday ishlaydi:</b>\n"
     "1️⃣ YouTube yoki Instagram'dan video havolasini yuboring\n"
     "2️⃣ Yoki shunchaki qo'shiq nomini yoz — bot musiqani topib beradi\n"
-    "3️⃣ G'alati savol yoki istalgan matn yuborsang — baribir musiqa chiqadi 🎶\n\n"
+    "3️⃣ G'alati savol yoki istalgan matn yuborsang — baribir musiqa chiqadi 🎶\n"
+    "4️⃣ 🎤 <b>Ovozli xabar yuborsang</b> — bot musiqani tanib, MP3 qilib "
+    "jo'natadi (Shazam kabi)\n\n"
     "<b>Qo'llab-quvvatlanadi:</b> YouTube, YouTube Music, Instagram, "
     "TikTok, SoundCloud\n\n"
     "🔹 /start — boshlash\n"
@@ -113,6 +119,99 @@ def make_progress_hook(status: StatusUpdater, platform: str):
     return hook
 
 
+async def deliver_music(
+    message: Message,
+    updater: StatusUpdater,
+    *,
+    url: Optional[str] = None,
+    query: Optional[str] = None,
+    platform: str = "YouTube",
+) -> None:
+    """Musiqani yuklab Telegram'ga jo'natadi (query yoki tayyor URL bo'yicha)."""
+    path: Optional[str] = None
+    info: dict = {}
+
+    try:
+        if query:
+            candidates = await asyncio.to_thread(downloader.search_candidates, query)
+            if not candidates:
+                raise downloader.DownloadError(
+                    "Hech narsa topilmadi — boshqa nom bilan urinib ko'ring."
+                )
+
+            # Topilgan variantlarni birin-ketin yuklashga urinamiz:
+            # birinchi video ochilmasa — keyingisiga o'tamiz.
+            last_error: Optional[Exception] = None
+            for candidate_url, candidate_title in candidates:
+                updater.set(
+                    f"🎵 Topildi: <b>{html.escape(candidate_title)}</b>\n"
+                    "⏳ Yuklanmoqda...",
+                    force=True,
+                )
+                try:
+                    path, info = await asyncio.to_thread(
+                        downloader.download_audio,
+                        candidate_url,
+                        make_progress_hook(updater, platform),
+                    )
+                    url = candidate_url
+                    break
+                except downloader.DownloadError as exc:
+                    last_error = exc
+                    log.info("Variant yuklanmadi %s -> %s", candidate_url, exc)
+
+            if path is None:
+                raise last_error or downloader.DownloadError(
+                    "Musiqani yuklab bo'lmadi — boshqasini urinib ko'ring."
+                )
+        else:
+            updater.set(f"⏳ <b>{platform}</b>: musiqa yuklanmoqda...", force=True)
+            path, info = await asyncio.to_thread(
+                downloader.download_audio, url, make_progress_hook(updater, platform)
+            )
+    except downloader.DownloadError as exc:
+        log.warning("Yuklashda xatolik %s -> %s", url or query, exc)
+        await updater.done(f"❌ {html.escape(str(exc))}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Kutilmagan xatolik: %s", url or query)
+        await updater.done(f"❌ Kutilmagan xatolik: {html.escape(str(exc))[:200]}")
+        return
+
+    try:
+        size = os.path.getsize(path)
+        if size > config.MAX_FILESIZE:
+            await updater.done(
+                "❌ Fayl juda katta (> 50 MB) — Telegram buni qabul qilmaydi."
+            )
+            return
+
+        title = downloader.track_title(info)
+        artist = downloader.track_artist(info)
+        duration = info.get("duration") or None
+        if duration:
+            duration = int(duration)
+
+        await updater.set("📤 Jo'natilmoqda...", force=True)
+        await message.answer_audio(
+            audio=FSInputFile(path),
+            caption=f"🎵 {html.escape(title)}\n👤 {html.escape(artist)}\n\n"
+            f"Manba: <b>{html.escape(platform)}</b>",
+            performer=artist[:255],
+            title=title[:255],
+            duration=duration,
+            reply_to_message_id=message.message_id,
+        )
+        await updater.delete()
+        log.info("Jo'natildi: %s — %s", title, platform)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Jo'natishda xatolik")
+        await updater.done(f"❌ Jo'natib bo'lmadi: {html.escape(str(exc))[:200]}")
+    finally:
+        if path:
+            downloader.cleanup(path)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
@@ -124,6 +223,68 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
+
+
+@router.message(F.voice | F.audio)
+async def on_voice(message: Message, bot: Bot) -> None:
+    """Ovozli xabar → musiqani aniqlash (Shazam) → MP3 jo'natish."""
+    media = message.voice or message.audio
+    if media is None:
+        return
+
+    duration = int(media.duration or 0)
+    status = await message.reply("🔎 Ovoz tahlil qilinmoqda...")
+    updater = StatusUpdater(status)
+
+    async with slot:
+        updater.set(
+            "🔎 Ovoz tahlil qilinmoqda... (5-10 soniya musiqa yaxshi taniladi)",
+            force=True,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="voice_") as tmp:
+            extension = ".oga" if message.voice else os.path.splitext(media.file_name or "")[1]
+            source = os.path.join(tmp, f"voice{extension or '.oga'}")
+
+            try:
+                file = await bot.get_file(media.file_id)
+                await bot.download_file(file.file_path, destination=source)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Ovozni olishda xatolik: %s", exc)
+                await updater.done(f"❌ Ovozni olib bo'lmadi: {html.escape(str(exc))[:150]}")
+                return
+
+            try:
+                found = await recognizer.recognize(source, duration)
+            except recognizer.RecognitionError as exc:
+                await updater.done(f"❌ {html.escape(str(exc))}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Tanishda kutilmagan xatolik")
+                await updater.done(f"❌ Tanib bo'lmadi: {html.escape(str(exc))[:150]}")
+                return
+
+            if not found:
+                await updater.done(
+                    "❌ Bu ovozdan musiqa aniqlanmadi.\n"
+                    "Musiqali qismini (kamida 5-10 soniya) yuboring — "
+                    "ataylab qo'ying va ovozli xabar yuboring."
+                )
+                return
+
+            title, artist = found
+            log.info("Tanildi: %s — %s", title, artist)
+            updater.set(
+                f"🎯 Topildi: <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
+                "🔍 YouTube'da qidirilmoqda...",
+                force=True,
+            )
+            await deliver_music(
+                message,
+                updater,
+                query=f"{artist} {title}",
+                platform="YouTube",
+            )
 
 
 @router.message(F.text)
@@ -151,6 +312,7 @@ async def on_text(message: Message) -> None:
     else:
         # Link emas — qo'shiq nomi, g'alati savol yoki istalgan matn:
         # shuni YouTube'da qidirib, birinchi natijadan musiqa chiqaramiz.
+        platform = "YouTube"
         query = text[:200]
         status = await message.reply(
             f"🔍 «{html.escape(query)}» bo'yicha qidirilmoqda..."
@@ -158,111 +320,11 @@ async def on_text(message: Message) -> None:
 
     updater = StatusUpdater(status)
 
+    if query:
+        updater.set(f"🔍 «{html.escape(query)}» bo'yicha qidirilmoqda...", force=True)
+
     async with slot:
-        path: Optional[str] = None
-        info: dict = {}
-
-        if query:
-            # 1) Matnni YouTube'da qidiramiz
-            updater.set(
-                f"🔍 «{html.escape(query)}» bo'yicha qidirilmoqda...", force=True
-            )
-            try:
-                candidates = await asyncio.to_thread(
-                    downloader.search_candidates, query
-                )
-            except downloader.DownloadError as exc:
-                log.warning("Qidiruvda xatolik %s -> %s", query, exc)
-                await updater.done(f"❌ {html.escape(str(exc))}")
-                return
-            except Exception as exc:  # noqa: BLE001
-                log.exception("Qidiruvda kutilmagan xatolik: %s", query)
-                await updater.done(
-                    f"❌ Kutilmagan xatolik: {html.escape(str(exc))[:200]}"
-                )
-                return
-
-            # 2) Topilgan variantlarni birin-ketin yuklashga urinamiz:
-            # birinchi video ochilmasa — keyingisiga o'tamiz.
-            platform = "YouTube"
-            last_error: Optional[Exception] = None
-            for candidate_url, candidate_title in candidates:
-                updater.set(
-                    f"🎵 Topildi: <b>{html.escape(candidate_title)}</b>\n"
-                    "⏳ Yuklanmoqda...",
-                    force=True,
-                )
-                try:
-                    path, info = await asyncio.to_thread(
-                        downloader.download_audio,
-                        candidate_url,
-                        make_progress_hook(updater, platform),
-                    )
-                    url = candidate_url
-                    break
-                except downloader.DownloadError as exc:
-                    last_error = exc
-                    log.info("Variant yuklanmadi %s -> %s", candidate_url, exc)
-
-            if path is None:
-                await updater.done(
-                    "❌ "
-                    + html.escape(
-                        str(last_error)
-                        if last_error
-                        else "Musiqani yuklab bo'lmadi — boshqasini urinib ko'ring."
-                    )
-                )
-                return
-        else:
-            updater.set(f"⏳ <b>{platform}</b>: musiqa yuklanmoqda...", force=True)
-            try:
-                path, info = await asyncio.to_thread(
-                    downloader.download_audio, url, make_progress_hook(updater, platform)
-                )
-            except downloader.DownloadError as exc:
-                log.warning("Yuklashda xatolik %s -> %s", url, exc)
-                await updater.done(f"❌ {html.escape(str(exc))}")
-                return
-            except Exception as exc:  # noqa: BLE001
-                log.exception("Kutilmagan xatolik: %s", url)
-                await updater.done(
-                    f"❌ Kutilmagan xatolik: {html.escape(str(exc))[:200]}"
-                )
-                return
-
-        try:
-            size = os.path.getsize(path)
-            if size > config.MAX_FILESIZE:
-                await updater.done(
-                    "❌ Fayl juda katta (> 50 MB) — Telegram buni qabul qilmaydi."
-                )
-                return
-
-            title = downloader.track_title(info)
-            artist = downloader.track_artist(info)
-            duration = info.get("duration") or None
-            if duration:
-                duration = int(duration)
-
-            await updater.set("📤 Jo'natilmoqda...", force=True)
-            await message.answer_audio(
-                audio=FSInputFile(path),
-                caption=f"🎵 {html.escape(title)}\n👤 {html.escape(artist)}\n\n"
-                f"Manba: <b>{html.escape(platform)}</b>",
-                performer=artist[:255],
-                title=title[:255],
-                duration=duration,
-                reply_to_message_id=message.message_id,
-            )
-            await updater.delete()
-            log.info("Jo'natildi: %s — %s", title, platform)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Jo'natishda xatolik")
-            await updater.done(f"❌ Jo'natib bo'lmadi: {html.escape(str(exc))[:200]}")
-        finally:
-            if path:
-                downloader.cleanup(path)
+        await deliver_music(message, updater, url=url, query=query, platform=platform)
 
 
 async def main() -> None:
@@ -275,7 +337,12 @@ async def main() -> None:
     dp.include_router(router)
 
     me = await bot.get_me()
-    log.info("Muzik Top ishga tushdi: @%s (id=%s)", me.username, me.id)
+    log.info(
+        "Muzik Top ishga tushdi: @%s (id=%s) | Shazam: %s",
+        me.username,
+        me.id,
+        "yoqilgan" if recognizer.AVAILABLE else "o'rnatilmagan",
+    )
     await dp.start_polling(bot)
 
 
