@@ -64,7 +64,9 @@ def is_supported(url: str) -> bool:
     return platform_of(url) != "Boshqa"
 
 
-def _build_options(tmp_dir: str, progress: Optional[ProgressHook]) -> dict:
+def _build_options(
+    tmp_dir: str, progress: Optional[ProgressHook], client: Optional[str] = None
+) -> dict:
     options: dict[str, Any] = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(tmp_dir, "media.%(ext)s"),
@@ -84,6 +86,8 @@ def _build_options(tmp_dir: str, progress: Optional[ProgressHook]) -> dict:
             }
         ],
     }
+    if client:
+        options["extractor_args"] = {"youtube": {"player_client": [client]}}
     if progress:
         options["progress_hooks"] = [progress]
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
@@ -105,8 +109,9 @@ def _friendly_error(raw: str) -> str:
         return "Video topilmadi yoki o'chirilgan bo'lishi mumkin."
     if "sign in" in low or "login" in low or "cookies" in low or "confirm your age" in low:
         return (
-            "Instagram/Youtube kirishni talab qilayapti. "
-            "`cookies.txt` faylini loyiha papkasiga qo'ying (README da tavsiflangan)."
+            "YouTube/Instagram kirishni talab qilayapti. "
+            "`cookies.txt` faylini loyiha papkasiga qo'ying (README da tavsiflangan) "
+            "yoki birozdan keyin qayta urinib ko'ring."
         )
     if "429" in low or "too many requests" in low:
         return "Server cheklovdan o'tdi — birozdan keyin qayta urinib ko'ring."
@@ -118,6 +123,25 @@ def _friendly_error(raw: str) -> str:
         return "YouTube hozircha yuklashni vaqtincha cheklamoqda — keyinroq urinib ko'ring."
 
     return text[:300]
+
+
+def _is_client_error(raw: str) -> bool:
+    """YouTube "bot tekshiruvi" kabi xatolikmi?
+
+    Bunday holatda boshqa player_client bilan qayta urinib ko'rish mumkin.
+    """
+    low = raw.lower()
+    markers = (
+        "sign in to confirm",
+        "not a bot",
+        "page needs to be reloaded",
+        "requested format is not available",
+        "http error 403",
+        "http error 503",
+        "confirm your age",
+        "use --cookies",
+    )
+    return any(marker in low for marker in markers)
 
 
 def _find_output(tmp_dir: str) -> Optional[str]:
@@ -145,39 +169,68 @@ def _extract_info(data: Optional[dict]) -> Optional[dict]:
     return data
 
 
+# YouTube'da "bot tekshiruvi" (sign in to confirm you're not a bot")
+# uchun alternativ player_client lar — biri ishlamasa keyingisiga o'tamiz.
+YOUTUBE_CLIENTS: tuple[str, ...] = ("android", "web", "tv", "ios", "mweb")
+
+
 def download_audio(
     url: str,
     progress: Optional[ProgressHook] = None,
 ) -> tuple[str, dict[str, Any]]:
     """Audio faylni yuklab oladi va (yo'l, metadata) qaytaradi.
 
+    YouTube bloklovchi xatolik bersa — avtomatik ravishda boshqa
+    player_client bilan qayta uriniladi (cookies shart emas).
+
     Qaytarilgan fayl `tmp_dir` ichida joylashgan — uni o'chirish
     mas'uliyati chaqiruvchida (bot.py).
     """
-    tmp_dir = tempfile.mkdtemp(prefix="muzik_top_")
-    options = _build_options(tmp_dir, progress)
+    is_youtube = "youtu" in url.lower()
+    clients: tuple[Optional[str], ...] = YOUTUBE_CLIENTS if is_youtube else (None,)
+    last_error: Optional[DownloadError] = None
 
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            raw_info = ydl.extract_info(url, download=True)
-    except YTDLPDownloadError as exc:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise DownloadError(_friendly_error(str(exc))) from exc
-    except Exception as exc:  # noqa: BLE001 - har qanday xatolikni o'zbekchaga chiqaramiz
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise DownloadError(_friendly_error(str(exc))) from exc
+    for index, client in enumerate(clients):
+        is_last = index == len(clients) - 1
+        tmp_dir = tempfile.mkdtemp(prefix="muzik_top_")
+        options = _build_options(tmp_dir, progress, client)
 
-    info = _extract_info(raw_info)
-    if info is None:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise DownloadError("Videoma'lumotni olib bo'lmadi.")
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                raw_info = ydl.extract_info(url, download=True)
+        except YTDLPDownloadError as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            last_error = DownloadError(_friendly_error(str(exc)))
+            if _is_client_error(str(exc)) and not is_last:
+                log.info("player_client=%s ishlamadi, keyingisini sinaymiz", client)
+                continue
+            raise last_error from exc
+        except Exception as exc:  # noqa: BLE001 - xatolikni o'zbekchaga chiqaramiz
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise DownloadError(_friendly_error(str(exc))) from exc
 
-    path = _find_output(tmp_dir)
-    if not path:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise DownloadError("Audio faylni yaratib bo'lmadi.")
+        info = _extract_info(raw_info)
+        if info is None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            last_error = DownloadError("Videoma'lumotni olib bo'lmadi.")
+            if not is_last:
+                continue
+            raise last_error
 
-    return path, info
+        path = _find_output(tmp_dir)
+        if not path:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            last_error = DownloadError("Audio faylni yaratib bo'lmadi.")
+            if not is_last:
+                log.info("player_client=%s audio yaratmadi, keyingisini sinaymiz", client)
+                continue
+            raise last_error
+
+        if client:
+            log.info("Muvaffaqiyatli player_client=%s", client)
+        return path, info
+
+    raise last_error or DownloadError("Audio faylni yuklab bo'lmadi.")
 
 
 def cleanup(path: str) -> None:
@@ -187,6 +240,48 @@ def cleanup(path: str) -> None:
         shutil.rmtree(folder, ignore_errors=True)
     except OSError as exc:
         log.warning("Tozalashda xatolik: %s", exc)
+
+
+def search_first(query: str) -> tuple[str, str]:
+    """So'rov bo'yicha YouTube'dan birinchi natijani topadi.
+
+    Returns:
+        (video_url, sarlavha)
+    """
+    cleaned = re.sub(r"\s+", " ", query).strip()
+    if not cleaned:
+        raise DownloadError("Bo'sh so'rov.")
+
+    options: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+        "default_search": "ytsearch",
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            data = ydl.extract_info(f"ytsearch1:{cleaned}", download=False)
+    except YTDLPDownloadError as exc:
+        raise DownloadError(_friendly_error(str(exc))) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise DownloadError(_friendly_error(str(exc))) from exc
+
+    entries = [e for e in (data or {}).get("entries") or [] if e]
+    if not entries:
+        raise DownloadError("Hech narsa topilmadi — boshqa nom bilan urinib ko'ring.")
+
+    first = entries[0]
+    link = first.get("webpage_url") or ""
+    if not link and first.get("id"):
+        link = f"https://www.youtube.com/watch?v={first['id']}"
+    if not link:
+        raise DownloadError("Topilgan video havolasini olib bo'lmadi.")
+
+    title = str(first.get("title") or cleaned).strip()
+    return link, title
 
 
 def track_title(info: dict) -> str:

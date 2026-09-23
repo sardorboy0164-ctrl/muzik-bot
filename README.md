@@ -9,6 +9,8 @@
 - 📺 **YouTube / YouTube Music** — video yoki playlist havolasidan MP3 olish
 - 📸 **Instagram** — Reels va postlardan audio ajratish
 - 🎧 Qo'shimcha ravishda **TikTok, SoundCloud, Vimeo** havolalari ham ishlaydi
+- 🔎 **Qidiruv** — link emas, shunchaki qo'shiq nomini yozsangiz ham musiqa topiladi
+- 💬 G'alati savol yoki istalgan matn yuborsangiz — baribir mos musiqa chiqadi
 - ⚡️ Parallel yuklash (bir vaqtda nechta bo'lsa)
 - 🌐 Butunlay o'zbekcha interfeys
 

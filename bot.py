@@ -37,7 +37,8 @@ HELP_TEXT = (
     "🎧 <b>Muzik Top</b> — video linkidan musiqa olib beruvchi bot.\n\n"
     "<b>Qanday ishlaydi:</b>\n"
     "1️⃣ YouTube yoki Instagram'dan video havolasini yuboring\n"
-    "2️⃣ Bot musiqani MP3 ko'rinishida jo'natadi\n\n"
+    "2️⃣ Yoki shunchaki qo'shiq nomini yoz — bot musiqani topib beradi\n"
+    "3️⃣ G'alati savol yoki istalgan matn yuborsang — baribir musiqa chiqadi 🎶\n\n"
     "<b>Qo'llab-quvvatlanadi:</b> YouTube, YouTube Music, Instagram, "
     "TikTok, SoundCloud\n\n"
     "🔹 /start — boshlash\n"
@@ -127,29 +128,62 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(F.text)
 async def on_text(message: Message) -> None:
-    text = message.text or ""
-    url = downloader.find_url(text)
+    text = (message.text or "").strip()
 
-    if not url:
-        await message.answer(
-            "Link topilmadi. Iltimos, YouTube yoki Instagram video havolasini yuboring.\n\n"
-            "Misol: <code>https://youtu.be/abc123</code>\n\n"
-            "Boshqa buyruqlar: /help"
-        )
+    if text.startswith("/"):
+        await message.answer("Noma'lum buyruq — /help ni bosing.")
         return
 
-    platform = downloader.platform_of(url)
-    if not downloader.is_supported(url):
+    url = downloader.find_url(text)
+
+    if url and not downloader.is_supported(url):
+        platform = downloader.platform_of(url)
         await message.answer(
             f"Bu platforma hozircha qo'llab-quvvatlanmaydi: <b>{html.escape(platform)}</b>\n"
             "YouTube yoki Instagram linkini yuboring."
         )
         return
 
-    status = await message.reply(f"⏳ <b>{platform}</b>: tayyorlanmoqda...")
+    query: Optional[str] = None
+    if url:
+        platform = downloader.platform_of(url)
+        status = await message.reply(f"⏳ <b>{platform}</b>: tayyorlanmoqda...")
+    else:
+        # Link emas — qo'shiq nomi, g'alati savol yoki istalgan matn:
+        # shuni YouTube'da qidirib, birinchi natijadan musiqa chiqaramiz.
+        query = text[:200]
+        status = await message.reply(
+            f"🔍 «{html.escape(query)}» bo'yicha qidirilmoqda..."
+        )
+
     updater = StatusUpdater(status)
 
     async with slot:
+        if query:
+            updater.set(
+                f"🔍 «{html.escape(query)}» bo'yicha qidirilmoqda...", force=True
+            )
+            try:
+                url, found_title = await asyncio.to_thread(
+                    downloader.search_first, query
+                )
+            except downloader.DownloadError as exc:
+                log.warning("Qidiruvda xatolik %s -> %s", query, exc)
+                await updater.done(f"❌ {html.escape(str(exc))}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Qidiruvda kutilmagan xatolik: %s", query)
+                await updater.done(
+                    f"❌ Kutilmagan xatolik: {html.escape(str(exc))[:200]}"
+                )
+                return
+
+            platform = "YouTube"
+            updater.set(
+                f"🎵 Topildi: <b>{html.escape(found_title)}</b>\n⏳ Yuklanmoqda...",
+                force=True,
+            )
+
         updater.set(f"⏳ <b>{platform}</b>: musiqa yuklanmoqda...", force=True)
         path: Optional[str] = None
         try:
