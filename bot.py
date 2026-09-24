@@ -192,7 +192,7 @@ async def deliver_music(
         if duration:
             duration = int(duration)
 
-        await updater.set("📤 Jo'natilmoqda...", force=True)
+        updater.set("📤 Jo'natilmoqda...", force=True)
         await message.answer_audio(
             audio=FSInputFile(path),
             caption=f"🎵 {html.escape(title)}\n👤 {html.escape(artist)}\n\n"
