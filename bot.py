@@ -225,14 +225,24 @@ async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
 
 
-@router.message(F.voice | F.audio)
+@router.message(F.voice | F.audio | F.video_note)
 async def on_voice(message: Message, bot: Bot) -> None:
     """Ovozli xabar → musiqani aniqlash (Shazam) → MP3 jo'natish."""
-    media = message.voice or message.audio
+    media = message.voice or message.audio or message.video_note
     if media is None:
         return
 
-    duration = int(media.duration or 0)
+    if message.voice:
+        kind, extension = "ovozli xabar", ".oga"
+    elif message.video_note:
+        kind, extension = "dumaloq video", ".mp4"
+    else:
+        kind = "audio fayl"
+        extension = os.path.splitext(getattr(media, "file_name", None) or "")[1] or ".mp3"
+
+    duration = int(getattr(media, "duration", 0) or 0)
+    log.info("Ovoz keldi (%s): %s soniya — tahlil boshlandi", kind, duration or "?")
+
     status = await message.reply("🔎 Ovoz tahlil qilinmoqda...")
     updater = StatusUpdater(status)
 
@@ -243,8 +253,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
         )
 
         with tempfile.TemporaryDirectory(prefix="voice_") as tmp:
-            extension = ".oga" if message.voice else os.path.splitext(media.file_name or "")[1]
-            source = os.path.join(tmp, f"voice{extension or '.oga'}")
+            source = os.path.join(tmp, f"voice{extension}")
 
             try:
                 file = await bot.get_file(media.file_id)
@@ -254,9 +263,13 @@ async def on_voice(message: Message, bot: Bot) -> None:
                 await updater.done(f"❌ Ovozni olib bo'lmadi: {html.escape(str(exc))[:150]}")
                 return
 
+            size = os.path.getsize(source) if os.path.exists(source) else 0
+            log.info("Ovoz yuklab olindi: %.1f KB | kengaytma %s", size / 1024, extension)
+
             try:
                 found = await recognizer.recognize(source, duration)
             except recognizer.RecognitionError as exc:
+                log.warning("Shazam xatoligi: %s", exc)
                 await updater.done(f"❌ {html.escape(str(exc))}")
                 return
             except Exception as exc:  # noqa: BLE001
@@ -265,10 +278,14 @@ async def on_voice(message: Message, bot: Bot) -> None:
                 return
 
             if not found:
+                log.warning("Shazam topmadi (%s, %s sek)", kind, duration or "?")
                 await updater.done(
-                    "❌ Bu ovozdan musiqa aniqlanmadi.\n"
-                    "Musiqali qismini (kamida 5-10 soniya) yuboring — "
-                    "ataylab qo'ying va ovozli xabar yuboring."
+                    "❌ Bu ovozdan musiqa aniqlanmadi.\n\n"
+                    "Sabablari bo'lishi mumkin:\n"
+                    "• qo'shiq Shazam bazasida yo'q (yangi/notanirgan)\n"
+                    "• ovoz juda qisqa yoki shovqinli\n\n"
+                    "Tekshirish uchun: musiqani kuylab yozib yuboring "
+                    "yoki qo'shiq nomini matn sifatida yozing — bot topib beradi."
                 )
                 return
 
@@ -325,6 +342,19 @@ async def on_text(message: Message) -> None:
 
     async with slot:
         await deliver_music(message, updater, url=url, query=query, platform=platform)
+
+
+@router.message()
+async def on_other(message: Message) -> None:
+    """Boshqa turdagi xabarlar (rasm, stiker, video va h.k.) uchun maslahat."""
+    await message.answer(
+        "🤔 Bunday xabarni o'qimadim.\n\n"
+        "Menga quyidagilarni yuboring:\n"
+        "📺 YouTube/Instagram link\n"
+        "✍️ qo'shiq nomi yoki istalgan matn\n"
+        "🎤 ovozli xabar (musiqani tanib beradi)\n\n"
+        "Barcha buyruqlar: /help"
+    )
 
 
 async def main() -> None:
