@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from typing import Any, Callable, Optional
@@ -36,9 +37,77 @@ HOST_HINTS: tuple[tuple[str, str], ...] = (
 
 ProgressHook = Callable[[dict], None]
 
+# Telegram bot uchun fayl chegarasi (~50 MB) — xavfsiz bilan ishlaymiz
+TELEGRAM_LIMIT = 48 * 1024 * 1024
+
 
 class DownloadError(Exception):
     """Foydalanuvchiga ko'rsatiladigan xatolik."""
+
+
+def _bitrate_for(duration: Optional[int]) -> str:
+    """50 MB chegarasiga sig'digan bitratni tanlaydi (to'liq trek uchun)."""
+    if not duration:
+        return AUDIO_QUALITY
+    minutes = float(duration) / 60
+    if minutes <= 30:
+        return "192"
+    if minutes <= 50:
+        return "128"
+    if minutes <= 100:
+        return "64"
+    if minutes <= 135:
+        return "48"
+    return "32"
+
+
+def _shrink_to_fit(path: str, info: dict) -> str:
+    """Fayl 50 MB dan katta bo'lsa — qayta siqib, **to'liq** yuborishga imkon beradi."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return path
+    if size <= TELEGRAM_LIMIT:
+        return path
+
+    duration = info.get("duration")
+    target = int(_bitrate_for(duration))
+    chain: list[int] = []
+    for bitrate in (target, 128, 96, 64, 48, 40, 32):
+        if bitrate <= target and bitrate not in chain:
+            chain.append(bitrate)
+
+    log.info(
+        "Fayl katta (%.1f MB), to'liq yuborish uchun siqilmoqda (davomiylik %s sek)",
+        size / 1024 / 1024,
+        duration or "?",
+    )
+
+    for bitrate in chain:
+        candidate = f"{path}.{bitrate}.mp3"
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", path,
+            "-vn", "-ac", "2", "-b:a", f"{bitrate}k",
+            candidate,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            log.warning("Siqishda xatolik (%s kbps): %s", bitrate, exc)
+            if os.path.exists(candidate):
+                os.remove(candidate)
+            continue
+
+        new_size = os.path.getsize(candidate)
+        if new_size <= TELEGRAM_LIMIT:
+            log.info("Siqildi: %d kbps → %.1f MB", bitrate, new_size / 1024 / 1024)
+            os.remove(path)
+            return candidate
+        os.remove(candidate)
+
+    log.warning("Chegaraga sig'dirib bo'lmadi (min %d kbps)", chain[-1] if chain else 0)
+    return path
 
 
 def find_url(text: Optional[str]) -> Optional[str]:
@@ -78,6 +147,7 @@ def _build_options(
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        "concurrent_fragment_downloads": 4,
         "ignoreerrors": False,
         "postprocessors": [
             {
@@ -97,10 +167,11 @@ def _build_options(
     return options
 
 
-def _friendly_error(raw: str) -> str:
+def _friendly_error(raw: str, url: str = "") -> str:
     """yt-dlp xatosini o'zbekcha, tushunarli xabarga aylantiradi."""
     low = raw.lower()
     text = re.sub(r"\s+", " ", raw).strip()
+    is_instagram = "instagram" in (url or "").lower() or "instagram" in low
 
     if "unsupported url" in low:
         return "Bu havola qo'llab-quvvatlanmaydi. YouTube yoki Instagram linkini yuboring."
@@ -108,11 +179,21 @@ def _friendly_error(raw: str) -> str:
         return "Bu video yoki kanal yopiq (private) — uni olish mumkin emas."
     if "video unavailable" in low or "not available" in low:
         return "Video topilmadi yoki o'chirilgan bo'lishi mumkin."
-    if "sign in" in low or "login" in low or "cookies" in low or "confirm your age" in low:
+    if "unable to extract" in low and is_instagram:
         return (
-            "YouTube/Instagram kirishni talab qilayapti. "
-            "`cookies.txt` faylini loyiha papkasiga qo'ying (README da tavsiflangan) "
-            "yoki birozdan keyin qayta urinib ko'ring."
+            "Instagram hozircha kirishni (login) talab qilayapti. "
+            "Loyiha papkasiga `cookies.txt` qo'ying — README da qanday olishi "
+            "tavsiflangan. YouTube havolasi esa ishlaydi."
+        )
+    if "sign in" in low or "login" in low or "cookies" in low or "confirm your age" in low:
+        if is_instagram:
+            return (
+                "Instagram kirishni talab qilayapti. `cookies.txt` faylini loyiha "
+                "papkasiga qo'ying (README da tavsiflangan)."
+            )
+        return (
+            "YouTube kirishni talab qilayapti. `cookies.txt` faylini loyiha papkasiga "
+            "qo'ying (README da tavsiflangan) yoki birozdan keyin qayta urinib ko'ring."
         )
     if "429" in low or "too many requests" in low:
         return "Server cheklovdan o'tdi — birozdan keyin qayta urinib ko'ring."
@@ -201,14 +282,14 @@ def download_audio(
                 raw_info = ydl.extract_info(url, download=True)
         except YTDLPDownloadError as exc:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            last_error = DownloadError(_friendly_error(str(exc)))
+            last_error = DownloadError(_friendly_error(str(exc), url))
             if _is_client_error(str(exc)) and not is_last:
                 log.info("player_client=%s ishlamadi, keyingisini sinaymiz", client)
                 continue
             raise last_error from exc
         except Exception as exc:  # noqa: BLE001 - xatolikni o'zbekchaga chiqaramiz
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise DownloadError(_friendly_error(str(exc))) from exc
+            raise DownloadError(_friendly_error(str(exc), url)) from exc
 
         info = _extract_info(raw_info)
         if info is None:
@@ -229,6 +310,8 @@ def download_audio(
 
         if client:
             log.info("Muvaffaqiyatli player_client=%s", client)
+        # 50 MB dan katta bo'lsa — to'liq trek yo'qotilmasligi uchun siqamiz
+        path = _shrink_to_fit(path, info)
         return path, info
 
     raise last_error or DownloadError("Audio faylni yuklab bo'lmadi.")

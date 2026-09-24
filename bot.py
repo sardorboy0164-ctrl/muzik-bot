@@ -9,6 +9,7 @@ Foydalanuvchi:
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import logging
 import os
@@ -36,6 +37,49 @@ log = logging.getLogger("muzik-top")
 
 router = Router()
 slot = asyncio.Semaphore(config.MAX_CONCURRENT)
+
+# Bir foydalanuvchi bir vaqtda bitta buyruq bajaradi (spam paytida server himoyasi)
+BUSY_USERS: set[int] = set()
+
+
+def single_task(func):
+    """Xabarlar navbatini boshqaradigan dekorator — bot "uxlab qolmasligi" uchun."""
+
+    @functools.wraps(func)
+    async def wrapper(message: Message, *args, **kwargs):
+        user_id = message.from_user.id if message.from_user else 0
+        if user_id in BUSY_USERS:
+            try:
+                await message.answer(
+                    "⏳ Oldingi buyrug'ingiz hali bajarilmoqda — biroz kuting, "
+                    "navbat turadi."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        BUSY_USERS.add(user_id)
+        try:
+            return await func(message, *args, **kwargs)
+        finally:
+            BUSY_USERS.discard(user_id)
+
+    return wrapper
+
+
+async def _search(query: str):
+    """YouTube qidiruvi — vaqt chegarasi bilan."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(downloader.search_candidates, query),
+        timeout=config.SEARCH_TIMEOUT,
+    )
+
+
+async def _download(url: str, hook):
+    """Audio yuklash — vaqt chegarasi bilan (bot hech qachon osib qolmaydi)."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(downloader.download_audio, url, hook),
+        timeout=config.DOWNLOAD_TIMEOUT,
+    )
 
 HELP_TEXT = (
     "🎧 <b>Muzik Top</b> — video linkidan musiqa olib beruvchi bot.\n\n"
@@ -133,7 +177,7 @@ async def deliver_music(
 
     try:
         if query:
-            candidates = await asyncio.to_thread(downloader.search_candidates, query)
+            candidates = await _search(query)
             if not candidates:
                 raise downloader.DownloadError(
                     "Hech narsa topilmadi — boshqa nom bilan urinib ko'ring."
@@ -149,8 +193,7 @@ async def deliver_music(
                     force=True,
                 )
                 try:
-                    path, info = await asyncio.to_thread(
-                        downloader.download_audio,
+                    path, info = await _download(
                         candidate_url,
                         make_progress_hook(updater, platform),
                     )
@@ -166,9 +209,14 @@ async def deliver_music(
                 )
         else:
             updater.set(f"⏳ <b>{platform}</b>: musiqa yuklanmoqda...", force=True)
-            path, info = await asyncio.to_thread(
-                downloader.download_audio, url, make_progress_hook(updater, platform)
-            )
+            path, info = await _download(url, make_progress_hook(updater, platform))
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning("Vaqt tugadi (timeout): %s", url or query)
+        await updater.done(
+            "⏱ Yuklash juda sekin bo'ldi va to'xtatildi.\n"
+            "Server hozir band — birozdan keyin qayta yuboring."
+        )
+        return
     except downloader.DownloadError as exc:
         log.warning("Yuklashda xatolik %s -> %s", url or query, exc)
         await updater.done(f"❌ {html.escape(str(exc))}")
@@ -226,6 +274,7 @@ async def cmd_help(message: Message) -> None:
 
 
 @router.message(F.voice | F.audio | F.video_note)
+@single_task
 async def on_voice(message: Message, bot: Bot) -> None:
     """Ovozli xabar → musiqani aniqlash (Shazam) → MP3 jo'natish."""
     media = message.voice or message.audio or message.video_note
@@ -305,6 +354,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
 
 
 @router.message(F.text)
+@single_task
 async def on_text(message: Message) -> None:
     text = (message.text or "").strip()
 

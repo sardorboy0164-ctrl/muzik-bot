@@ -14,6 +14,12 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 # Bir vaqtda nechta yuklanishga ruxsat (serverni yormaslik uchun)
 MAX_CONCURRENT: int = int(os.getenv("MAX_CONCURRENT", "3"))
 
+# Yuklash uchun maksimal vaqt (sekund) — o'tsa, bot "uxlamasdan" javob beradi
+DOWNLOAD_TIMEOUT: int = int(os.getenv("DOWNLOAD_TIMEOUT", "240"))
+
+# Qidiruv uchun maksimal vaqt (sekund)
+SEARCH_TIMEOUT: int = int(os.getenv("SEARCH_TIMEOUT", "60"))
+
 # Instagram uchun cookie fayli (majburiy emas, lekin yopiq kontent uchun kerak)
 COOKIES_FILE: str = os.getenv("COOKIES_FILE", "cookies.txt").strip()
 
